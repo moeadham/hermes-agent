@@ -1,6 +1,12 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { useI18n } from '@/i18n'
+import {
+  type RealtimeTranscript,
+  type RealtimeVoiceProvider,
+  RealtimeVoiceSession,
+  type RealtimeVoiceStatus
+} from '@/lib/realtime-voice-session'
 import { startThinkingSound, stopThinkingSound } from '@/lib/thinking-sound'
 import { monitorSpeechDuringPlayback } from '@/lib/voice-barge-in'
 import {
@@ -17,6 +23,7 @@ import { $voicePlayback } from '@/store/voice-playback'
 import { useMicRecorder } from './use-mic-recorder'
 
 export type ConversationStatus = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
+export type VoiceInputMode = 'legacy' | 'realtime'
 
 interface PendingVoiceResponse {
   id: string
@@ -27,6 +34,7 @@ interface PendingVoiceResponse {
 interface VoiceConversationOptions {
   busy: boolean
   enabled: boolean
+  mode?: VoiceInputMode
   onFatalError?: () => void
   /** Interrupt the in-flight agent turn (the same seam as the Stop button).
    *  Fired when the user speaks while the model is still generating. */
@@ -39,6 +47,8 @@ interface VoiceConversationOptions {
   /** Awaited right before the mic is opened. Used to let the wake-word listener
    *  fully release the capture device first, so the two never contend. */
   beforeMicOpen?: () => Promise<void> | void
+  realtimeProvider?: RealtimeVoiceProvider
+  sessionId?: string | null
 }
 
 /** How long a barge-triggered interrupt may take to settle before we submit
@@ -48,6 +58,7 @@ const INTERRUPT_SETTLE_TIMEOUT_MS = 5_000
 export function useVoiceConversation({
   busy,
   enabled,
+  mode = 'legacy',
   onFatalError,
   onInterrupt,
   onStopWord,
@@ -55,7 +66,9 @@ export function useVoiceConversation({
   onTranscribeAudio,
   pendingResponse,
   consumePendingResponse,
-  beforeMicOpen
+  beforeMicOpen,
+  realtimeProvider = 'openai',
+  sessionId
 }: VoiceConversationOptions) {
   const { t } = useI18n()
   const voiceCopy = t.notifications.voice
@@ -69,6 +82,12 @@ export function useVoiceConversation({
   const responseIdRef = useRef<string | null>(null)
   const spokenSourceLengthRef = useRef(0)
   const speechSessionRef = useRef<null | SpeechStreamSession>(null)
+  const realtimeSessionRef = useRef<RealtimeVoiceSession | null>(null)
+  const realtimeSubmittingRef = useRef(false)
+  const realtimeInterruptPromiseRef = useRef<Promise<void> | null>(null)
+  const acceptedRealtimeTurnIdsRef = useRef(new Set<string>())
+  const pendingRealtimeTurnIdsRef = useRef(new Set<string>())
+  const generatedRealtimeSessionIdRef = useRef<string | null>(null)
   const stopBargeMonitorRef = useRef<(() => void) | null>(null)
   const bargeCapturePendingRef = useRef(false)
   const bargedRef = useRef(false)
@@ -80,11 +99,30 @@ export function useVoiceConversation({
   const wasEnabledRef = useRef(enabled)
   const onStopWordRef = useRef(onStopWord)
   const onInterruptRef = useRef(onInterrupt)
+  const modeRef = useRef(mode)
+  const realtimeProviderRef = useRef(realtimeProvider)
+
+  if (!generatedRealtimeSessionIdRef.current) {
+    generatedRealtimeSessionIdRef.current =
+      typeof globalThis.crypto?.randomUUID === 'function'
+        ? `desktop-voice-${globalThis.crypto.randomUUID()}`
+        : `desktop-voice-${Date.now()}-${Math.random().toString(36).slice(2)}`
+  }
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     onInterruptRef.current = onInterrupt
   }, [onInterrupt])
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  useEffect(() => {
+    modeRef.current = mode
+  }, [mode])
+
+  // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
+  useEffect(() => {
+    realtimeProviderRef.current = realtimeProvider
+  }, [realtimeProvider])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -134,6 +172,160 @@ export function useVoiceConversation({
     responseIdRef.current = null
     spokenSourceLengthRef.current = 0
   }
+
+  const closeRealtimeSession = () => {
+    realtimeSessionRef.current?.disconnect()
+    realtimeSessionRef.current = null
+    realtimeSubmittingRef.current = false
+    realtimeInterruptPromiseRef.current = null
+    acceptedRealtimeTurnIdsRef.current.clear()
+    pendingRealtimeTurnIdsRef.current.clear()
+  }
+
+  const applyRealtimeStatus = useCallback((next: RealtimeVoiceStatus) => {
+    if (next === 'idle') {
+      setStatus('idle')
+    } else if (next === 'transcribing') {
+      setStatus('transcribing')
+    } else if (next === 'connecting' || next === 'error') {
+      setStatus('idle')
+    } else if (statusRef.current !== 'thinking' && statusRef.current !== 'speaking') {
+      setStatus('listening')
+    }
+  }, [])
+
+  const waitForRealtimeInterruptToSettle = useCallback(async () => {
+    const interruptPromise = realtimeInterruptPromiseRef.current
+    const deadline = Date.now() + INTERRUPT_SETTLE_TIMEOUT_MS
+
+    if (interruptPromise) {
+      await Promise.race([
+        interruptPromise.catch(() => undefined),
+        new Promise(resolve => window.setTimeout(resolve, INTERRUPT_SETTLE_TIMEOUT_MS))
+      ])
+    }
+
+    while (busyRef.current && Date.now() < deadline) {
+      await new Promise(resolve => window.setTimeout(resolve, 100))
+    }
+  }, [])
+
+  const submitRealtimeTranscript = useCallback(
+    async (turn: RealtimeTranscript) => {
+      if (acceptedRealtimeTurnIdsRef.current.has(turn.id) || pendingRealtimeTurnIdsRef.current.has(turn.id)) {
+        return
+      }
+
+      const text = turn.text.trim()
+
+      if (!text) {
+        return
+      }
+
+      if (isVoiceStopCommand(text)) {
+        acceptedRealtimeTurnIdsRef.current.add(turn.id)
+        awaitingSpokenResponseRef.current = false
+        dropSpeechSession()
+        closeRealtimeSession()
+        setStatus('idle')
+        onStopWordRef.current?.()
+
+        return
+      }
+
+      pendingRealtimeTurnIdsRef.current.add(turn.id)
+
+      if (busyRef.current || realtimeInterruptPromiseRef.current) {
+        await waitForRealtimeInterruptToSettle()
+      }
+
+      acceptedRealtimeTurnIdsRef.current.add(turn.id)
+      realtimeSubmittingRef.current = true
+      awaitingSpokenResponseRef.current = true
+      dropSpeechSession()
+      consumePendingResponse()
+      setStatus('thinking')
+
+      try {
+        await onSubmit(text)
+      } catch (error) {
+        acceptedRealtimeTurnIdsRef.current.delete(turn.id)
+        awaitingSpokenResponseRef.current = false
+        notifyError(error, voiceCopy.transcriptionFailed)
+        setStatus('listening')
+      } finally {
+        pendingRealtimeTurnIdsRef.current.delete(turn.id)
+        realtimeSubmittingRef.current = false
+      }
+    },
+    [consumePendingResponse, onSubmit, voiceCopy.transcriptionFailed, waitForRealtimeInterruptToSettle]
+  )
+
+  const startRealtimeListening = useCallback(async () => {
+    pendingStartRef.current = false
+
+    if (!enabledRef.current || mutedRef.current || busyRef.current) {
+      return
+    }
+
+    try {
+      await beforeMicOpenRef.current?.()
+    } catch {
+      // A wake-listener pause failure should not block realtime voice start.
+    }
+
+    if (!enabledRef.current || mutedRef.current || busyRef.current) {
+      return
+    }
+
+    closeRealtimeSession()
+
+    const realtime = new RealtimeVoiceSession({
+      onError: error => {
+        notifyError(error, voiceCopy.couldNotStartSession)
+        closeRealtimeSession()
+        pendingStartRef.current = true
+        setStatus('idle')
+        onFatalError?.()
+      },
+      onPartialTranscript: event => {
+        // Partials are UI/status only; Hermes gets finalized transcripts.
+        void event
+      },
+      onSpeechStarted: () => {
+        markVoicePlaybackInterrupted()
+        stopVoicePlayback()
+
+        if (busyRef.current) {
+          let interruptPromise: Promise<void>
+
+          try {
+            interruptPromise = Promise.resolve(onInterruptRef.current?.()).then(() => undefined)
+          } catch (error) {
+            interruptPromise = Promise.reject(error)
+          }
+
+          realtimeInterruptPromiseRef.current = interruptPromise
+          void interruptPromise
+            .catch(() => undefined)
+            .finally(() => {
+              if (realtimeInterruptPromiseRef.current === interruptPromise) {
+                realtimeInterruptPromiseRef.current = null
+              }
+            })
+        }
+      },
+      onStatus: applyRealtimeStatus,
+      onTranscript: transcript => void submitRealtimeTranscript(transcript)
+    })
+
+    realtimeSessionRef.current = realtime
+    await realtime.connect({
+      provider: realtimeProviderRef.current,
+      sessionId: sessionId || generatedRealtimeSessionIdRef.current!
+    })
+    realtime.setMuted(mutedRef.current)
+  }, [applyRealtimeStatus, beforeMicOpenRef, onFatalError, sessionId, submitRealtimeTranscript, voiceCopy.couldNotStartSession])
 
   const handleTurn = useCallback(
     async (forceTranscribe = false) => {
@@ -204,6 +396,12 @@ export function useVoiceConversation({
   )
 
   const startListening = useCallback(async () => {
+    if (modeRef.current === 'realtime') {
+      await startRealtimeListening()
+
+      return
+    }
+
     pendingStartRef.current = false
 
     if (!enabledRef.current || mutedRef.current || busyRef.current) {
@@ -259,7 +457,7 @@ export function useVoiceConversation({
       setStatus('idle')
       onFatalError?.()
     }
-  }, [handle, handleTurn, onFatalError, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
+  }, [handle, handleTurn, onFatalError, startRealtimeListening, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
 
   const settleAfterSpeech = useCallback(
     (barged: boolean) => {
@@ -378,6 +576,10 @@ export function useVoiceConversation({
    * all call this).
    */
   const ensureBargeMonitor = useCallback(() => {
+    if (modeRef.current === 'realtime') {
+      return
+    }
+
     if (stopBargeMonitorRef.current) {
       return
     }
@@ -541,7 +743,7 @@ export function useVoiceConversation({
   )
 
   const start = useCallback(async () => {
-    if (!onTranscribeAudio) {
+    if (modeRef.current !== 'realtime' && !onTranscribeAudio) {
       notify({
         kind: 'warning',
         title: voiceCopy.unavailable,
@@ -555,6 +757,7 @@ export function useVoiceConversation({
     setMuted(false)
     awaitingSpokenResponseRef.current = false
     dropSpeechSession()
+    closeRealtimeSession()
     consumePendingResponse()
     pendingStartRef.current = true
     await startListening()
@@ -571,6 +774,7 @@ export function useVoiceConversation({
     pendingStartRef.current = false
     clearTurnTimeout()
     stopVoicePlayback()
+    closeRealtimeSession()
     handle.cancel()
     turnClosingRef.current = false
     awaitingSpokenResponseRef.current = false
@@ -592,9 +796,11 @@ export function useVoiceConversation({
 
       if (next) {
         clearTurnTimeout()
+        realtimeSessionRef.current?.setMuted(true)
         handle.cancel()
         setStatus('idle')
       } else if (enabledRef.current && !busyRef.current && statusRef.current === 'idle') {
+        realtimeSessionRef.current?.setMuted(false)
         pendingStartRef.current = true
       }
 

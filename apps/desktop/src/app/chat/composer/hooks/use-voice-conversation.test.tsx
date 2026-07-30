@@ -34,6 +34,31 @@ vi.mock('@/lib/voice-playback', () => ({
   stopVoicePlayback: () => stopVoicePlayback()
 }))
 
+const realtimeInstances: Array<{
+  callbacks: {
+    onPartialTranscript?: (transcript: { id: string; text: string }) => void
+    onSpeechStarted?: () => void
+    onTranscript: (transcript: { id: string; text: string }) => void
+  }
+  connect: ReturnType<typeof vi.fn>
+  disconnect: ReturnType<typeof vi.fn>
+  setMuted: ReturnType<typeof vi.fn>
+}> = []
+
+vi.mock('@/lib/realtime-voice-session', () => ({
+  RealtimeVoiceSession: class {
+    callbacks: (typeof realtimeInstances)[number]['callbacks']
+    connect = vi.fn(async () => undefined)
+    disconnect = vi.fn()
+    setMuted = vi.fn()
+
+    constructor(callbacks: (typeof realtimeInstances)[number]['callbacks']) {
+      this.callbacks = callbacks
+      realtimeInstances.push(this)
+    }
+  }
+}))
+
 vi.mock('@/lib/thinking-sound', () => ({
   startThinkingSound: vi.fn(),
   stopThinkingSound: vi.fn()
@@ -137,6 +162,7 @@ async function enterThinking(hook: ReturnType<typeof renderConversation>['hook']
 describe('useVoiceConversation full-duplex barge-in', () => {
   beforeEach(() => {
     monitorCalls.length = 0
+    realtimeInstances.length = 0
     vi.clearAllMocks()
     micHandle.start.mockResolvedValue(undefined)
     micHandle.stop.mockResolvedValue(null)
@@ -262,5 +288,195 @@ describe('useVoiceConversation full-duplex barge-in', () => {
     hook.rerender({ busy: true })
 
     expect(monitorCalls.length).toBe(armed)
+  })
+
+  it('uses realtime transport in realtime mode and submits only finalized transcripts', async () => {
+    const onSubmit = vi.fn()
+
+    const hook = renderHook(() =>
+      useVoiceConversation({
+        busy: false,
+        consumePendingResponse: vi.fn(),
+        enabled: true,
+        mode: 'realtime',
+        onSubmit,
+        onTranscribeAudio: vi.fn(async () => 'legacy should not run'),
+        pendingResponse: () => null,
+        realtimeProvider: 'elevenlabs',
+        sessionId: 'desktop-session'
+      })
+    )
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    expect(realtimeInstances).toHaveLength(1)
+    expect(realtimeInstances[0]!.connect).toHaveBeenCalledWith({
+      provider: 'elevenlabs',
+      sessionId: 'desktop-session'
+    })
+
+    act(() => {
+      realtimeInstances[0]!.callbacks.onPartialTranscript?.({ id: 'seg-1', text: 'hel' })
+      realtimeInstances[0]!.callbacks.onTranscript({ id: 'seg-1', text: 'hello' })
+      realtimeInstances[0]!.callbacks.onTranscript({ id: 'seg-1', text: 'hello' })
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledTimes(1))
+    expect(onSubmit).toHaveBeenCalledWith('hello')
+  })
+
+  it('ends realtime voice on a finalized stop command instead of submitting it', async () => {
+    const onSubmit = vi.fn()
+    const onStopWord = vi.fn()
+
+    const hook = renderHook(() =>
+      useVoiceConversation({
+        busy: false,
+        consumePendingResponse: vi.fn(),
+        enabled: true,
+        mode: 'realtime',
+        onStopWord,
+        onSubmit,
+        pendingResponse: () => null
+      })
+    )
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    act(() => {
+      realtimeInstances[0]!.callbacks.onTranscript({ id: 'seg-stop', text: 'never mind' })
+    })
+
+    await waitFor(() => expect(onStopWord).toHaveBeenCalledTimes(1))
+
+    expect(onSubmit).not.toHaveBeenCalled()
+
+    expect(realtimeInstances[0]!.disconnect).toHaveBeenCalledTimes(1)
+
+    expect(hook.result.current.status).toBe('idle')
+  })
+
+  it('does not arm the legacy barge monitor while realtime provider mic owns barge-in', async () => {
+    const onInterrupt = vi.fn()
+
+    const pendingResponseState: { current: { id: string; pending: boolean; text: string } | null } = {
+      current: null
+    }
+
+    const onBusyChange: { current: (busy: boolean) => void } = { current: () => undefined }
+
+    const onSubmit = vi.fn(() => {
+      pendingResponseState.current = { id: 'reply-1', pending: true, text: '' }
+      onBusyChange.current(true)
+    })
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          mode: 'realtime',
+          onInterrupt,
+          onSubmit,
+          pendingResponse: () => pendingResponseState.current
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    onBusyChange.current = busy => hook.rerender({ busy })
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    act(() => {
+      realtimeInstances[0]!.callbacks.onTranscript({ id: 'seg-1', text: 'change course' })
+    })
+
+    await waitFor(() => expect(onSubmit).toHaveBeenCalledWith('change course'))
+    await waitFor(() => expect(hook.result.current.status).toBe('speaking'))
+    expect(monitorCalls).toHaveLength(0)
+
+    act(() => {
+      realtimeInstances[0]!.callbacks.onSpeechStarted?.()
+    })
+
+    expect(onInterrupt).toHaveBeenCalledTimes(1)
+    expect(stopVoicePlayback).toHaveBeenCalled()
+  })
+
+  it('submits a realtime final that arrives immediately after speech-start while interrupt is settling', async () => {
+    let settleInterrupt!: () => void
+
+    const onInterrupt = vi.fn(
+      () =>
+        new Promise<void>(resolve => {
+          settleInterrupt = resolve
+        })
+    )
+
+    let currentBusy = false
+
+    const acceptedSubmissions: string[] = []
+    const droppedSubmissions: string[] = []
+
+    const onSubmit = vi.fn((text: string) => {
+      if (currentBusy) {
+        droppedSubmissions.push(text)
+
+        return
+      }
+
+      acceptedSubmissions.push(text)
+    })
+
+    const hook = renderHook(
+      ({ busy }: HookProps) =>
+        useVoiceConversation({
+          busy,
+          consumePendingResponse: vi.fn(),
+          enabled: true,
+          mode: 'realtime',
+          onInterrupt,
+          onSubmit,
+          pendingResponse: () => null
+        }),
+      { initialProps: { busy: false } }
+    )
+
+    await act(async () => {
+      await hook.result.current.start()
+    })
+
+    await act(async () => {
+      currentBusy = true
+      hook.rerender({ busy: true })
+    })
+
+    act(() => {
+      realtimeInstances[0]!.callbacks.onSpeechStarted?.()
+      realtimeInstances[0]!.callbacks.onTranscript({ id: 'seg-barge', text: 'actually use this' })
+      realtimeInstances[0]!.callbacks.onTranscript({ id: 'seg-barge', text: 'actually use this' })
+    })
+
+    expect(onInterrupt).toHaveBeenCalledTimes(1)
+    expect(acceptedSubmissions).toEqual([])
+
+    await act(async () => {
+      settleInterrupt()
+    })
+
+    await act(async () => {
+      currentBusy = false
+      hook.rerender({ busy: false })
+    })
+
+    await waitFor(() => expect(acceptedSubmissions).toEqual(['actually use this']))
+    expect(droppedSubmissions).toEqual([])
   })
 })

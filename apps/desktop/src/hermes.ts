@@ -49,6 +49,7 @@ import type {
   ProfileSetupCommand,
   ProfileSoul,
   ProfilesResponse,
+  RealtimeVoiceSessionResponse,
   SessionInfo,
   SessionMessagesResponse,
   SessionSearchResponse,
@@ -192,6 +193,7 @@ export type {
   ProjectFolder,
   ProjectInfo,
   ProjectsPayload,
+  RealtimeVoiceSessionResponse,
   RpcEvent,
   SessionCreateResponse,
   SessionInfo,
@@ -1567,6 +1569,23 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
     // encoding finish. Remote providers and long clips regularly exceed the
     // default 15s Electron backend timeout.
     timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl)
+  })
+}
+
+export function createRealtimeVoiceSession(
+  sessionId: string,
+  language?: string,
+  provider?: 'openai' | 'elevenlabs'
+): Promise<RealtimeVoiceSessionResponse> {
+  return window.hermesDesktop.api<RealtimeVoiceSessionResponse>({
+    path: '/api/audio/realtime/session',
+    method: 'POST',
+    ...profileScoped(),
+    body: {
+      session_id: sessionId,
+      ...(language ? { language } : {}),
+      ...(provider ? { provider } : {})
+    }
   })
 }
 

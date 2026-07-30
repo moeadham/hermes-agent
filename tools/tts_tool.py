@@ -3379,7 +3379,11 @@ def stream_tts_to_speaker(
 
         # Prefer a chunked streamer for low time-to-first-audio; fall back to
         # per-sentence sync synthesis (universal — edge + every non-streamer).
-        from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
+        from tools.tts_streaming import (
+            ContinuousTextTTSProvider,
+            SentenceChunker,
+            resolve_streaming_provider,
+        )
         streamer = resolve_streaming_provider(tts_config, preferred=provider)
 
         stream_max_len = 0
@@ -3412,6 +3416,13 @@ def stream_tts_to_speaker(
                 except Exception as exc:
                     logger.warning("sounddevice OutputStream failed: %s", exc)
                     output_stream = None
+
+            if isinstance(streamer, ContinuousTextTTSProvider) and output_stream is None:
+                logger.debug(
+                    "continuous TTS provider resolved without live PCM output; "
+                    "falling back to sentence-chunked TTS"
+                )
+                streamer = None
 
         chunker = SentenceChunker()
         long_flush_len = 100
@@ -3530,6 +3541,31 @@ def stream_tts_to_speaker(
                         os.unlink(tmp_path)
                     except OSError:
                         pass
+
+        if isinstance(streamer, ContinuousTextTTSProvider):
+            try:
+                audio_iter = streamer.stream_turn(text_queue, stop_event)
+                if output_stream is not None:
+                    import numpy as _np
+
+                    try:
+                        from tools.voice_mode import mark_audio_output_active
+                    except Exception:
+                        def mark_audio_output_active(_active):
+                            return None
+                    mark_audio_output_active(True)
+                    try:
+                        for chunk in audio_iter:
+                            if stop_event.is_set():
+                                break
+                            output_stream.write(_np.frombuffer(chunk, dtype=_np.int16).reshape(-1, 1))
+                    finally:
+                        mark_audio_output_active(False)
+                else:
+                    _play_via_tempfile(audio_iter, stop_event, streamer.sample_rate)
+            except Exception as exc:
+                logger.warning("Continuous streaming TTS turn failed: %s", exc)
+            return
 
         while not stop_event.is_set():
             # Read next delta from queue

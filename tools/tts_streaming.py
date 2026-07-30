@@ -22,7 +22,9 @@ the dispatcher, config gate (`tts.<name>.streaming`), and resolver come free.
 from __future__ import annotations
 
 import logging
+import queue
 import re
+import threading
 import time
 from abc import ABC, abstractmethod
 from typing import Callable, Dict, Iterator, List, Optional
@@ -149,6 +151,18 @@ class StreamingTTSProvider(ABC):
         """Yield PCM chunks for ``text``. Raise on failure (caller logs)."""
 
 
+class ContinuousTextTTSProvider(StreamingTTSProvider):
+    """A provider session that accepts incremental text for one assistant turn."""
+
+    @abstractmethod
+    def stream_turn(
+        self,
+        text_queue: "queue.Queue[Optional[str]]",
+        stop_event: threading.Event,
+    ) -> Iterator[bytes]:
+        """Yield audio for deltas read from *text_queue* until sentinel/stop."""
+
+
 _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
 
 
@@ -170,6 +184,34 @@ def _try_instantiate(name: str, tts_config: Dict) -> Optional[StreamingTTSProvid
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("streaming provider %s init failed: %s", name, exc)
         return None
+
+
+def provider_realtime_tts_capabilities(provider: str) -> Dict[str, bool]:
+    """Return honest realtime TTS capability flags for a configured provider.
+
+    ``streaming_audio_output`` means the provider can return audio chunks for a
+    complete text input. ``continuous_text_input`` is stricter: one provider
+    session can accept LLM deltas incrementally for the whole assistant turn.
+    """
+
+    name = (provider or "").strip().lower()
+    if name == "elevenlabs":
+        return {
+            "streaming_audio_output": True,
+            "continuous_text_input": True,
+        }
+    if name == "openai":
+        return {
+            "streaming_audio_output": True,
+            "continuous_text_input": False,
+        }
+    if name in {"gemini", "xai"}:
+        cls = _REGISTRY.get(name)
+        return {
+            "streaming_audio_output": bool(cls and cls.available()),
+            "continuous_text_input": False,
+        }
+    return {"streaming_audio_output": False, "continuous_text_input": False}
 
 
 # Fallback priority for ``tts.streaming.provider: auto`` — best chunked
@@ -250,6 +292,67 @@ class ElevenLabsStreamer(StreamingTTSProvider):
             model_id=model_id,
             output_format="pcm_24000",
         )
+
+
+@register("elevenlabs")
+class ElevenLabsContinuousTextStreamer(ContinuousTextTTSProvider):
+    """ElevenLabs WebSocket TTS that accepts LLM deltas for one whole turn."""
+
+    sample_rate = 24000
+
+    @staticmethod
+    def available() -> bool:
+        return bool(_resolve_key("ELEVENLABS_API_KEY", "elevenlabs"))
+
+    def stream(self, text: str) -> Iterator[bytes]:
+        text_queue: "queue.Queue[Optional[str]]" = queue.Queue()
+        text_queue.put(text)
+        text_queue.put(None)
+        yield from self.stream_turn(text_queue, threading.Event())
+
+    def stream_turn(
+        self,
+        text_queue: "queue.Queue[Optional[str]]",
+        stop_event: threading.Event,
+    ) -> Iterator[bytes]:
+        from tools.tts_tool import (
+            DEFAULT_ELEVENLABS_STREAMING_MODEL_ID,
+            DEFAULT_ELEVENLABS_VOICE_ID,
+            _elevenlabs_environment_kwargs,
+            _import_elevenlabs,
+        )
+
+        client = _import_elevenlabs()(
+            api_key=_resolve_key("ELEVENLABS_API_KEY", "elevenlabs"),
+            **_elevenlabs_environment_kwargs(self.section),
+        )
+        voice_id = self.section.get("voice_id", DEFAULT_ELEVENLABS_VOICE_ID)
+        model_id = self.section.get(
+            "streaming_model_id",
+            self.section.get("model_id", DEFAULT_ELEVENLABS_STREAMING_MODEL_ID),
+        )
+
+        def _deltas() -> Iterator[str]:
+            while not stop_event.is_set():
+                try:
+                    delta = text_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if delta is None:
+                    return
+                if delta:
+                    yield str(delta)
+
+        audio_iter = client.text_to_speech.convert_realtime(
+            voice_id=voice_id,
+            text=_deltas(),
+            model_id=model_id,
+            output_format="pcm_24000",
+        )
+        for chunk in _capped(audio_iter, "ElevenLabs continuous TTS"):
+            if stop_event.is_set():
+                break
+            yield chunk
 
 
 def _openai_config_api_key() -> str:

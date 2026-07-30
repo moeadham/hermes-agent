@@ -1460,6 +1460,19 @@ DEFAULT_CONFIG = {
         "record_key": "ctrl+b",
         "max_recording_seconds": 120,
         "auto_tts": False,
+        # Realtime voice input is opt-in. It is a transcription/VAD transport
+        # only; Hermes remains the conversation, tool, memory, and TTS owner.
+        "input_mode": "legacy",       # legacy | realtime
+        "realtime": {
+            "enabled": False,
+            "stt_provider": "openai",  # openai | elevenlabs
+            "transcription_model": "gpt-4o-transcribe",
+            "language": "",
+            "client_secret_ttl_seconds": 60,
+            "vad_threshold": 0.5,
+            "prefix_padding_ms": 300,
+            "silence_duration_ms": 500,
+        },
         "beep_enabled": True,         # Play record start/stop beeps in CLI voice mode
         "beep_volume": 0.3,           # Beep amplitude multiplier (0.0-1.0, default keeps prior hardcoded value)
         "thinking_sound": True,       # Calm ambient bubble sound while the agent works in voice chat (volume follows beep_volume)

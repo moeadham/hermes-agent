@@ -2,14 +2,36 @@ import { atom } from 'nanostores'
 
 import { getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 
+export type VoiceInputMode = 'legacy' | 'realtime'
+
 // "Read replies aloud" — mirrors the canonical `voice.auto_tts` config key (also
 // in Settings → Voice, honored by the messaging gateway) so the composer toggle
 // and the Settings switch are one source of truth, not two that can disagree.
 export const $autoSpeakReplies = atom<boolean>(false)
+export const $voiceInputMode = atom<VoiceInputMode>('legacy')
+export const $voiceRealtimeProvider = atom<'openai' | 'elevenlabs'>('openai')
 
 /** Seed the atom from a loaded config payload (mount / refresh). */
 export function applyAutoSpeakFromConfig(config: { voice?: { auto_tts?: unknown } | null } | null | undefined) {
   $autoSpeakReplies.set(Boolean(config?.voice?.auto_tts))
+}
+
+export function applyVoiceRealtimeFromConfig(
+  config:
+    | {
+        voice?: {
+          input_mode?: unknown
+          realtime?: { enabled?: unknown; stt_provider?: unknown } | null
+        } | null
+      }
+    | null
+    | undefined
+) {
+  const inputMode =
+    config?.voice?.input_mode === 'realtime' && config.voice.realtime?.enabled === true ? 'realtime' : 'legacy'
+
+  $voiceInputMode.set(inputMode)
+  $voiceRealtimeProvider.set(config?.voice?.realtime?.stt_provider === 'elevenlabs' ? 'elevenlabs' : 'openai')
 }
 
 // First configured `voice.stop_phrases` entry — drives the "Say "stop" to end
@@ -69,6 +91,39 @@ export async function setAutoSpeakReplies(enabled: boolean): Promise<void> {
     await saveHermesConfig({ ...record, voice: { ...voice, auto_tts: enabled } })
   } catch (error) {
     $autoSpeakReplies.set(previous)
+    throw error
+  }
+}
+
+export async function setVoiceInputMode(mode: VoiceInputMode): Promise<void> {
+  const previous = $voiceInputMode.get()
+
+  if (previous === mode) {
+    return
+  }
+
+  $voiceInputMode.set(mode)
+
+  try {
+    const record = await getHermesConfigRecord()
+    const voice = record.voice && typeof record.voice === 'object' ? (record.voice as Record<string, unknown>) : {}
+
+    const realtime =
+      voice.realtime && typeof voice.realtime === 'object' ? (voice.realtime as Record<string, unknown>) : {}
+
+    await saveHermesConfig({
+      ...record,
+      voice: {
+        ...voice,
+        input_mode: mode,
+        realtime: {
+          ...realtime,
+          enabled: mode === 'realtime'
+        }
+      }
+    })
+  } catch (error) {
+    $voiceInputMode.set(previous)
     throw error
   }
 }

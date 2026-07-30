@@ -97,6 +97,12 @@ class AudioTranscriptionRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
+class RealtimeVoiceSessionRequest(BaseModel):
+    session_id: str
+    language: Optional[str] = None
+    provider: Optional[Literal["openai", "elevenlabs"]] = None
+
+
 class ManagedFileUpload(BaseModel):
     path: str
     data_url: str
@@ -706,4 +712,3 @@ class _PluginProvidersPutBody(BaseModel):
 
 class _PluginVisibilityBody(BaseModel):
     hidden: bool
-

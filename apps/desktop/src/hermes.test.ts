@@ -7,6 +7,7 @@ import {
   AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS,
   audioSpeakRequestTimeoutMs,
   audioTranscribeRequestTimeoutMs,
+  createRealtimeVoiceSession,
   getCronJobs,
   getGlobalModelInfo,
   getGlobalModelOptions,
@@ -388,6 +389,32 @@ describe('Hermes REST helpers', () => {
       method: 'POST',
       path: '/api/audio/transcribe',
       timeoutMs: AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS
+    })
+  })
+
+  it('routes realtime voice credential brokering through the active profile backend', async () => {
+    setApiRequestProfile('rhaegal')
+    api.mockResolvedValueOnce({
+      ok: true,
+      provider: 'openai',
+      client_secret: 'eph',
+      expires_at: 123,
+      session_binding: 'binding'
+    })
+
+    await expect(createRealtimeVoiceSession('session-1', 'en', 'openai')).resolves.toEqual({
+      ok: true,
+      provider: 'openai',
+      client_secret: 'eph',
+      expires_at: 123,
+      session_binding: 'binding'
+    })
+
+    expect(api).toHaveBeenCalledWith({
+      body: { session_id: 'session-1', language: 'en', provider: 'openai' },
+      method: 'POST',
+      path: '/api/audio/realtime/session',
+      profile: 'rhaegal'
     })
   })
 

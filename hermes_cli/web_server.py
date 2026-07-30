@@ -1295,6 +1295,7 @@ from hermes_cli.web_models import (  # noqa: F401
     WhatsAppOnboardingStart,
     WhatsAppOnboardingApply,
     AudioTranscriptionRequest,
+    RealtimeVoiceSessionRequest,
     ManagedFileUpload,
     ChatImageUpload,
     ManagedDirectoryCreate,
@@ -4279,6 +4280,207 @@ async def transcribe_audio_upload(
         "transcript": str(result.get("transcript") or "").strip(),
         "provider": result.get("provider"),
     }
+
+
+@app.post("/api/audio/realtime/session")
+async def create_realtime_voice_session(
+    request: Request,
+    payload: RealtimeVoiceSessionRequest,
+    profile: Optional[str] = None,
+):
+    """Mint a short-lived realtime transcription credential.
+
+    This endpoint brokers provider credentials for browser/desktop transports.
+    Standard provider API keys stay backend-only; Hermes remains the only owner
+    of LLM turns, tools, memory, interruption, and TTS selection.
+    """
+
+    session_id = (payload.session_id or "").strip()
+    if not session_id or len(session_id) > 160 or not re.fullmatch(r"[A-Za-z0-9._:-]+", session_id):
+        raise HTTPException(status_code=400, detail="Invalid voice session binding")
+
+    with _config_profile_scope(profile):
+        config = load_config()
+        voice_cfg = config.get("voice") if isinstance(config, dict) else None
+        if not isinstance(voice_cfg, dict):
+            voice_cfg = {}
+        realtime_cfg = voice_cfg.get("realtime") if isinstance(voice_cfg.get("realtime"), dict) else {}
+        if voice_cfg.get("input_mode") != "realtime" or realtime_cfg.get("enabled") is not True:
+            raise HTTPException(status_code=409, detail="Realtime voice is disabled")
+
+        provider = (payload.provider or realtime_cfg.get("stt_provider") or "openai").strip().lower()
+        language = (payload.language or realtime_cfg.get("language") or "").strip()
+
+        if language and (
+            len(language) > 16
+            or not re.fullmatch(r"[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})?", language)
+        ):
+            raise HTTPException(status_code=400, detail="Invalid transcription language")
+
+        try:
+            if provider == "openai":
+                from agent.voice_realtime import broker_openai_realtime_transcription_session
+
+                return broker_openai_realtime_transcription_session(
+                    session_id=session_id,
+                    profile=profile,
+                    model=str(realtime_cfg.get("transcription_model") or "gpt-4o-transcribe"),
+                    language=language,
+                    ttl_seconds=int(realtime_cfg.get("client_secret_ttl_seconds") or 60),
+                    vad_threshold=float(realtime_cfg.get("vad_threshold") or 0.5),
+                    prefix_padding_ms=int(realtime_cfg.get("prefix_padding_ms") or 300),
+                    silence_duration_ms=int(realtime_cfg.get("silence_duration_ms") or 500),
+                )
+            if provider == "elevenlabs":
+                from agent.voice_realtime import broker_elevenlabs_realtime_stt_bridge_session
+
+                base_url = str(request.base_url).rstrip("/")
+                if base_url.startswith("http://"):
+                    base_ws_url = f"ws://{base_url[len('http://'):]}"
+                elif base_url.startswith("https://"):
+                    base_ws_url = f"wss://{base_url[len('https://'):]}"
+                else:
+                    base_ws_url = base_url
+
+                return broker_elevenlabs_realtime_stt_bridge_session(
+                    session_id=session_id,
+                    profile=profile,
+                    model_id=str(realtime_cfg.get("elevenlabs_model_id") or "scribe_v2_realtime"),
+                    language=language,
+                    ttl_seconds=int(realtime_cfg.get("client_secret_ttl_seconds") or 60),
+                    base_ws_url=base_ws_url,
+                )
+            raise HTTPException(
+                status_code=501,
+                detail=f"Realtime credential brokering is not available for {provider}",
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _log.exception("Realtime voice session brokering failed")
+            raise HTTPException(status_code=502, detail=f"Realtime voice session failed: {exc}")
+
+
+@app.websocket("/api/audio/realtime/elevenlabs/ws")
+async def elevenlabs_realtime_stt_bridge_ws(ws: "WebSocket") -> None:
+    """Backend-owned ElevenLabs Scribe realtime STT bridge.
+
+    The browser receives only a Hermes bridge token. This endpoint holds the
+    ElevenLabs API key server-side, forwards microphone chunks upstream as
+    ``input_audio_chunk`` messages, and relays ElevenLabs transcript/error
+    events back to the Desktop realtime transport.
+    """
+
+    token = (ws.query_params.get("token") or "").strip()
+    if not token:
+        await ws.close(code=4401)
+        return
+
+    from agent.voice_realtime import (
+        ELEVENLABS_REALTIME_STT_WS_URL,
+        consume_elevenlabs_realtime_stt_bridge_token,
+    )
+
+    bridge = consume_elevenlabs_realtime_stt_bridge_token(token)
+    if not bridge:
+        await ws.close(code=4401)
+        return
+
+    await ws.accept()
+
+    try:
+        import websockets
+        from urllib.parse import urlencode
+    except Exception:
+        await ws.send_json({"message_type": "error", "error": "ElevenLabs realtime bridge dependencies are unavailable"})
+        await ws.close(code=1011)
+        return
+
+    query = {
+        "model_id": bridge.get("model_id") or "scribe_v2_realtime",
+        "audio_format": "pcm_16000",
+        "sample_rate": "16000",
+    }
+    language = str(bridge.get("language") or "").strip()
+    if language:
+        query["language_code"] = language
+    upstream_url = f"{ELEVENLABS_REALTIME_STT_WS_URL}?{urlencode(query)}"
+    headers = {"xi-api-key": str(bridge["api_key"])}
+
+    async def _connect_upstream():
+        try:
+            return await websockets.connect(upstream_url, additional_headers=headers)
+        except TypeError:
+            return await websockets.connect(upstream_url, extra_headers=headers)
+
+    try:
+        async with await _connect_upstream() as upstream:
+            async def _client_to_upstream():
+                try:
+                    while True:
+                        message = await ws.receive()
+                        mtype = message.get("type")
+                        if mtype == "websocket.disconnect":
+                            break
+                        if message.get("bytes") is not None:
+                            await upstream.send(json.dumps({
+                                "message_type": "input_audio_chunk",
+                                "audio_base_64": base64.b64encode(message["bytes"]).decode("ascii"),
+                            }))
+                            continue
+                        text = message.get("text")
+                        if text is None:
+                            continue
+                        try:
+                            payload = json.loads(text)
+                        except Exception:
+                            continue
+                        if payload.get("stop"):
+                            break
+                        if payload.get("commit"):
+                            await upstream.send(json.dumps({
+                                "message_type": "input_audio_chunk",
+                                "audio_base_64": "",
+                                "commit": True,
+                            }))
+                        elif payload.get("audio_base_64"):
+                            await upstream.send(json.dumps({
+                                "message_type": "input_audio_chunk",
+                                "audio_base_64": str(payload["audio_base_64"]),
+                            }))
+                finally:
+                    with contextlib.suppress(Exception):
+                        await upstream.close()
+
+            async def _upstream_to_client():
+                async for event in upstream:
+                    if isinstance(event, (bytes, bytearray, memoryview)):
+                        await ws.send_bytes(bytes(event))
+                    else:
+                        await ws.send_text(str(event))
+
+            done, pending = await asyncio.wait(
+                {
+                    asyncio.create_task(_client_to_upstream()),
+                    asyncio.create_task(_upstream_to_client()),
+                },
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                task.result()
+    except WebSocketDisconnect:
+        return
+    except Exception as exc:
+        _log.warning("ElevenLabs realtime STT bridge failed: %s", exc)
+        with contextlib.suppress(Exception):
+            await ws.send_json({"message_type": "error", "error": "ElevenLabs realtime bridge failed"})
+    finally:
+        with contextlib.suppress(Exception):
+            await ws.close()
 
 
 def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
